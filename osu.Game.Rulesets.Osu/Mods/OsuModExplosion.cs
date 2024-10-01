@@ -9,7 +9,7 @@ using osu.Framework.Graphics.Sprites;
 using osu.Framework.Input.Bindings;
 using osu.Framework.Input.Events;
 using osu.Framework.Localisation;
-using osu.Framework.Logging;
+using osu.Framework.Utils;
 using osu.Game.Rulesets.Mods;
 using osu.Game.Rulesets.Objects;
 using osu.Game.Rulesets.Objects.Drawables;
@@ -18,10 +18,11 @@ using osu.Game.Rulesets.Osu.Objects.Drawables;
 using osu.Game.Rulesets.Osu.UI;
 using osu.Game.Rulesets.UI;
 using osuTK;
+using Logger = osu.Framework.Logging.Logger;
 
 namespace osu.Game.Rulesets.Osu.Mods
 {
-    internal partial class OsuModExplosion : Mod, IApplicableToDrawableRuleset<OsuHitObject>, IUpdatableByPlayfield, IApplicableToDrawableHitObject, IApplicableToHitObject
+    internal partial class OsuModExplosion : Mod, IApplicableToDrawableRuleset<OsuHitObject>, IUpdatableByPlayfield, IApplicableToHitObject
     {
         public override string Name => "Explosion";
         public override LocalisableString Description => "Explode the circles!";
@@ -32,72 +33,113 @@ namespace osu.Game.Rulesets.Osu.Mods
 
         public override ModType Type => ModType.DifficultyReduction;
 
-        private DrawableOsuRuleset ruleset;
-
-        private Dictionary<OsuHitObject, PhysicsState> physicsStates = new Dictionary<OsuHitObject, PhysicsState>();
-
-        private LinkedList<OsuAction> actions = new LinkedList<OsuAction>();
+        private DrawableOsuRuleset ruleset = null!;
+        private int unprocessedKeyDownCount;
+        private int unprocessedKeyUpCount;
 
         public void ApplyToDrawableRuleset(DrawableRuleset<OsuHitObject> drawableRuleset)
         {
             ruleset = (DrawableOsuRuleset)drawableRuleset;
-
             ruleset.KeyBindingInputManager.Add(new InputNotifier(this));
-            //physicsStates.Clear();
+
         }
 
-        private void HandleInput(OsuAction eAction)
+        private void HandleInput(OsuAction eAction, bool keyDown)
         {
             if (eAction == OsuAction.Smoke) return;
-            actions.AddLast(eAction);
+
+            if (keyDown)
+            {
+                unprocessedKeyDownCount++;
+            }
+            else
+            {
+                unprocessedKeyUpCount++;
+            }
         }
 
         public void Update(Playfield playfield)
         {
-            float deltaTime = (float)playfield.Clock.ElapsedFrameTime / 1000f;
+            float time = (float)playfield.Clock.CurrentTime;
 
+            Vector2 cursorPos = playfield.Cursor.AsNonNull().ActiveCursor.DrawPosition;
 
-            var cursorPos = playfield.Cursor.AsNonNull().ActiveCursor.DrawPosition;
-            var hitCount = actions.Count;
-            actions.Clear();
-
-            foreach (var drawableHitObject in playfield.HitObjectContainer.AliveObjects)
+            foreach (DrawableHitObject? drawableHitObject in playfield.HitObjectContainer.AliveObjects)
             {
-                if (drawableHitObject is DrawableHitCircle circle && !circle.Result.HasResult)
+                if (drawableHitObject is DrawableHitCircle circle)
                 {
-                    var state = physicsStates[(OsuHitObject)drawableHitObject.HitObject];
-                    var offset = circle.Position - cursorPos;
-
-                    if (hitCount > 0 && offset.Length < 400f && offset.Length > 0f)
+                    if (unprocessedKeyDownCount + unprocessedKeyUpCount is not 0)
                     {
-                        // magnituede based on distance from cursor
+                        float forceFactor = 200f;
+                        float variableForceFactor = Math.Clamp(1 - Vector2.Distance(cursorPos, circle.Position) / OsuPlayfield.BASE_SIZE.X, 0f, 0.5f);
+                        Vector2 normal = Vector2.Normalize(circle.Position - cursorPos);
+                        if (circle.Result.HasResult)
+                            continue;
 
-                        float duration = 0.2f;
-                        float factor = 400f;
-                        float magnituede = (float)Math.Pow(1f - offset.Length / 390, 3) * (factor / duration);
-                        Logger.Log("magmitude: " + magnituede, level: LogLevel.Verbose);
-                        var force = offset.Normalized() * magnituede;
-                        state.ApplyForce(force, duration);
-                        // Log all values
-                        //Logger.Log($"Force: {force}, Magnituede: {magnituede}, Offset: {offset}, Position: {circle.Position}, Cursor: {cursorPos}, DeltaTime {deltaTime} Velocity {state.Velocity}",
-                        //level: LogLevel.Verbose);
+                        if (unprocessedKeyDownCount is not 0)
+                        {
+                            Logger.Log("Key down");
+                            var destination = Vector2.Clamp(GetDestination(circle.Position, normal, forceFactor * variableForceFactor * unprocessedKeyDownCount), Vector2.Zero, OsuPlayfield.BASE_SIZE);
+                            //var destination = Vector2.Clamp(2 * circle.Position - cursorPos, Vector2.Zero, OsuPlayfield.BASE_SIZE);
+
+                            // Log Position and Destination
+                            //Logger.Log($"Position: {circle.Position} Destination: {destination}");
+                            AddForce(circle.HitObject, time, 700, destination);
+
+                        }
+
+                        if (unprocessedKeyUpCount is not 0)
+                        {
+                            //Logger.Log("Key up");
+
+                            var destination = Vector2.Clamp(GetDestination(circle.Position, normal, -0.5f * forceFactor * variableForceFactor * unprocessedKeyUpCount), Vector2.Zero, OsuPlayfield.BASE_SIZE);
+                            Logger.Log($"Position: {circle.Position} Destination: {destination}");
+
+                            AddForce(circle.HitObject, time, 700, destination);
+                        }
                     }
 
-                    var velobefore = state.Velocity;
-                    state.Update(deltaTime);
-                    //Logger.Log($"HitObject: {drawableHitObject}, Position: {circle.Position}, Velocity: {state.Velocity}", level: LogLevel.Verbose);
-                    Logger.Log($"Before: {velobefore} After: {state.Velocity}", level: LogLevel.Verbose);
+                    float x = drawableHitObject.Position.X;
+                    float y = drawableHitObject.Position.Y;
 
-                    var destination = Vector2.Clamp(circle.Position + state.Velocity * deltaTime, Vector2.Zero, OsuPlayfield.BASE_SIZE);
-
-                    if (destination.Y == Single.NaN)
+                    foreach (var (startTime, halfTime, destination) in hitObjectMovement[drawableHitObject.HitObject])
                     {
-                        return;
+                        if (time < startTime)
+                            continue;
+
+                       float dt = (float)Math.Min(time - startTime, playfield.Clock.ElapsedFrameTime);
+                       //float dt = (float)playfield.Clock.ElapsedFrameTime;
+
+                        x = (float)Interpolation.DampContinuously(x, destination.X, halfTime, dt);
+                        y = (float)Interpolation.DampContinuously(y, destination.Y, halfTime, dt);
                     }
 
-                    circle.Position = destination;
+                    drawableHitObject.Position = new Vector2(x, y);
                 }
+
+
             }
+            unprocessedKeyDownCount = 0;
+            unprocessedKeyUpCount = 0;
+        }
+
+        private Vector2 GetDestination(Vector2 origin, Vector2 direction, float factor)
+        {
+            return origin + direction * factor;
+        }
+
+        private void AddForce(OsuHitObject hitObject, float startTime, float halfTime, Vector2 destination)
+        {
+            hitObjectMovement[hitObject].Add((startTime, halfTime, destination));
+        }
+
+        public Dictionary<HitObject, List<(float startTime, float halfTime, Vector2 destination)>> hitObjectMovement =
+            new Dictionary<HitObject, List<(float startTime, float halfTime, Vector2 destination)>>();
+
+        public void ApplyToHitObject(HitObject hitObject)
+        {
+            if (hitObject is HitCircle circle)
+                this.hitObjectMovement[circle] = new List<(float startTime, float halfTime, Vector2 destination)>();
         }
 
         private partial class InputNotifier : Component, IKeyBindingHandler<OsuAction>
@@ -111,115 +153,14 @@ namespace osu.Game.Rulesets.Osu.Mods
 
             public bool OnPressed(KeyBindingPressEvent<OsuAction> e)
             {
-                mod.HandleInput(e.Action);
+                mod.HandleInput(e.Action, true);
                 return false;
             }
 
             public void OnReleased(KeyBindingReleaseEvent<OsuAction> e)
             {
+                mod.HandleInput(e.Action, false);
             }
-        }
-
-        public void ApplyToDrawableHitObject(DrawableHitObject drawable)
-        {
-            if (drawable is DrawableHitCircle circle)
-            {
-                //Logger.Log("Explosion mod applied to hit circle", level: LogLevel.Verbose);
-            }
-        }
-
-        public void ApplyToHitObject(HitObject hitObject)
-        {
-            if (hitObject is HitCircle circle)
-            {
-                physicsStates[circle] = new PhysicsState();
-            }
-        }
-
-        private class PhysicsState
-        {
-            public Vector2 Velocity { get; set; } = Vector2.Zero;
-            public LinkedList<Force> Forces { get; } = new LinkedList<Force>();
-
-
-            private float MaxVelocity => 400.0f;
-            private float FrictionBreakpoint => 300f;
-            private float FrictionCoefficient => 1000f;
-
-            public void Update(float deltaTime)
-            {
-                var node = Forces.First;
-
-                while (node != null)
-                {
-                    var next = node.Next;
-
-                    var force = node.Value;
-                    var old = force.Progress;
-                    force.Progress = Math.Min(force.Progress + deltaTime, force.Duration);
-
-                    deltaTime = force.Progress - old;
-                    var normalizedProgress = force.Progress / force.Duration;
-                    var velocityChange = force.Acceleration * deltaTime;
-                    //Logger.Log($"New Velocity: {velocityChange} Nor {normalizedProgress}", level: LogLevel.Verbose);
-                    Velocity += velocityChange;
-
-                    if (force.Progress == force.Duration)
-                    {
-                        Forces.Remove(node);
-                    }
-
-                    node = next;
-                }
-
-                if (Velocity.Length > 0f)
-                    Velocity = Math.Min(Velocity.Length, MaxVelocity) * Velocity.Normalized();
-
-                // Apply Friction - proportional to the velocity
-                ApplyFriction(deltaTime);
-            }
-
-            private void ApplyFriction(float deltaTime)
-            {
-                // Friction is proportional to velocity and opposite in direction
-                // Apply friction only if the object is moving
-                if (Velocity.Length > 0f)
-                {
-                    var frictionMagnitude = Velocity.Length * FrictionCoefficient * (float)Math.Pow(Math.Clamp(Velocity.Length / FrictionBreakpoint, 0f, 3f), 5);
-
-                    var newMagnitude = Math.Max(0f, Velocity.Length - frictionMagnitude * deltaTime);
-
-                    Velocity = Velocity.Normalized() * newMagnitude;
-
-                    // Optionally: if velocity is too small, stop completely (to avoid very small speeds due to precision issues)
-                    if (Velocity.Length < 3f && Forces.Count == 0)
-                    {
-                        Velocity = Vector2.Zero;
-                    }
-                }
-            }
-
-            public void ApplyForce(Vector2 acceleration, float duration)
-            {
-                Forces.AddLast(new Force
-                {
-                    Acceleration = acceleration,
-                    Duration = duration,
-                });
-            }
-
-            // https://easings.net/de#easeOutExpo
-            private float HorizFlippedEaseOutExpo(float t)
-            {
-                return Math.Clamp(1f - (t == 1f ? 1f : 1f - (float)Math.Pow(2d, -10d * t)), 0f, 1f);
-            }
-        }
-
-        private class Force
-        {
-            public Vector2 Acceleration { get; set; }
-            public float Progress { get; set; }
-            public float Duration { get; set; }
         }
     }
 }
